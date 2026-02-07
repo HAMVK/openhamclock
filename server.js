@@ -1320,6 +1320,147 @@ const DXSPIDER_PROXY_URL = process.env.DXSPIDER_PROXY_URL || 'https://dxspider-p
 let dxSpiderCache = { spots: [], timestamp: 0 };
 const DXSPIDER_CACHE_TTL = 90000; // 90 seconds cache - reduces reconnection frequency
 
+// DX Spider nodes - dxspider.co.uk primary per G6NHU
+// SSID -56 for OpenHamClock (HamClock uses -55)
+const DXSPIDER_NODES = [
+  { host: 'dxspider.co.uk', port: 7300 },
+  { host: 'dxc.nc7j.com', port: 7373 },
+  { host: 'dxc.ai9t.com', port: 7373 },
+  { host: 'dxc.w6cua.org', port: 7300 }
+];
+const DXSPIDER_SSID = '-56'; // OpenHamClock SSID
+
+// DX Spider telnet connection helper - used by both /api/dxcluster/spots and /api/dxcluster/paths
+function tryDXSpiderNode(node, userCallsign = null) {
+  return new Promise((resolve) => {
+    const spots = [];
+    let buffer = '';
+    let loginSent = false;
+    let commandSent = false;
+    let resolved = false;
+    
+    // Use user's callsign with SSID if provided, otherwise GUEST
+    const loginCallsign = userCallsign ? `${userCallsign.toUpperCase()}${DXSPIDER_SSID}` : 'GUEST';
+    
+    const client = new net.Socket();
+    client.setTimeout(12000);
+    
+    const cleanup = () => {
+      if (!resolved) {
+        resolved = true;
+        try { client.destroy(); } catch(e) {}
+      }
+    };
+    
+    // Try connecting to DX Spider node
+    client.connect(node.port, node.host, () => {
+      logDebug(`[DX Cluster] DX Spider: connected to ${node.host}:${node.port} as ${loginCallsign}`);
+    });
+    
+    client.on('data', (data) => {
+      buffer += data.toString();
+      
+      // Wait for login prompt
+      if (!loginSent && (buffer.includes('login:') || buffer.includes('Please enter your call') || buffer.includes('enter your callsign'))) {
+        loginSent = true;
+        client.write(`${loginCallsign}\r\n`);
+        return;
+      }
+      
+      // Wait for prompt after login, then send command
+      if (loginSent && !commandSent && (buffer.includes('Hello') || buffer.includes('de ') || buffer.includes('>') || buffer.includes('GUEST') || buffer.includes(loginCallsign.split('-')[0]))) {
+        commandSent = true;
+        setTimeout(() => {
+          if (!resolved) {
+            client.write('sh/dx 25\r\n');
+          }
+        }, 1000);
+        return;
+      }
+      
+      // Parse DX spots from the output
+      const lines = buffer.split('\n');
+      for (const line of lines) {
+        if (line.includes('DX de ')) {
+          const match = line.match(/DX de ([A-Z0-9\/\-]+):\s+(\d+\.?\d*)\s+([A-Z0-9\/\-]+)\s+(.+?)\s+(\d{4})Z/i);
+          if (match) {
+            const spotter = match[1].replace(':', '');
+            const freqKhz = parseFloat(match[2]);
+            const dxCall = match[3];
+            const comment = match[4].trim();
+            const timeStr = match[5];
+            
+            if (!isNaN(freqKhz) && freqKhz > 0 && dxCall) {
+              const freqMhz = (freqKhz / 1000).toFixed(3);
+              const time = timeStr.substring(0, 2) + ':' + timeStr.substring(2, 4) + 'z';
+              
+              // Avoid duplicates
+              if (!spots.find(s => s.call === dxCall && s.freq === freqMhz)) {
+                spots.push({
+                  freq: freqMhz,
+                  call: dxCall,
+                  comment: comment,
+                  time: time,
+                  spotter: spotter,
+                  source: 'DX Spider'
+                });
+              }
+            }
+          }
+        }
+      }
+      
+      // If we have enough spots, close connection
+      if (spots.length >= 20) {
+        client.write('bye\r\n');
+        setTimeout(cleanup, 500);
+      }
+    });
+    
+    client.on('timeout', () => {
+      cleanup();
+    });
+    
+    client.on('error', (err) => {
+      // Only log unexpected errors, not connection issues (they're common)
+      if (!err.message.includes('ECONNRESET') && !err.message.includes('ETIMEDOUT') && !err.message.includes('ENOTFOUND') && !err.message.includes('ECONNREFUSED')) {
+        logErrorOnce('DX Cluster', `DX Spider ${node.host}: ${err.message}`);
+      }
+      cleanup();
+    });
+    
+    client.on('close', () => {
+      if (!resolved) {
+        resolved = true;
+        if (spots.length > 0) {
+          logDebug('[DX Cluster] DX Spider:', spots.length, 'spots from', node.host);
+          dxSpiderCache = { spots: spots, timestamp: Date.now() };
+          resolve(spots);
+        } else {
+          resolve(null);
+        }
+      }
+    });
+    
+    // Fallback timeout - close after 15 seconds regardless
+    setTimeout(() => {
+      if (!resolved) {
+        if (spots.length > 0) {
+          resolved = true;
+          logDebug('[DX Cluster] DX Spider:', spots.length, 'spots from', node.host);
+          dxSpiderCache = { spots: spots, timestamp: Date.now() };
+          resolve(spots);
+        }
+        cleanup();
+        if (!resolved) {
+          resolved = true;
+          resolve(null);
+        }
+      }
+    }, 15000);
+  });
+}
+
 app.get('/api/dxcluster/spots', async (req, res) => {
   const source = (req.query.source || CONFIG.dxClusterSource || 'auto').toLowerCase();
   
@@ -1411,17 +1552,7 @@ app.get('/api/dxcluster/spots', async (req, res) => {
   }
   
   // Helper function for DX Spider (telnet-based, works locally/Pi)
-  // Multiple nodes for failover
-  // DX Spider nodes - dxspider.co.uk primary per G6NHU
-  // SSID -56 for OpenHamClock (HamClock uses -55)
-  const DXSPIDER_NODES = [
-    { host: 'dxspider.co.uk', port: 7300 },
-    { host: 'dxc.nc7j.com', port: 7373 },
-    { host: 'dxc.ai9t.com', port: 7373 },
-    { host: 'dxc.w6cua.org', port: 7300 }
-  ];
-  const DXSPIDER_SSID = '-56'; // OpenHamClock SSID
-  
+  // Multiple nodes for failover - uses module-level constants and tryDXSpiderNode
   async function fetchDXSpider() {
     // Check cache first (use longer cache to reduce connection attempts)
     if (Date.now() - dxSpiderCache.timestamp < DXSPIDER_CACHE_TTL && dxSpiderCache.spots.length > 0) {
@@ -1439,136 +1570,6 @@ app.get('/api/dxcluster/spots', async (req, res) => {
     
     logDebug('[DX Cluster] DX Spider: all nodes failed');
     return null;
-  }
-  
-  function tryDXSpiderNode(node, userCallsign = null) {
-    return new Promise((resolve) => {
-      const spots = [];
-      let buffer = '';
-      let loginSent = false;
-      let commandSent = false;
-      let resolved = false;
-      
-      // Use user's callsign with SSID if provided, otherwise GUEST
-      const loginCallsign = userCallsign ? `${userCallsign.toUpperCase()}${DXSPIDER_SSID}` : 'GUEST';
-      
-      const client = new net.Socket();
-      client.setTimeout(12000);
-      
-      const cleanup = () => {
-        if (!resolved) {
-          resolved = true;
-          try { client.destroy(); } catch(e) {}
-        }
-      };
-      
-      // Try connecting to DX Spider node
-      client.connect(node.port, node.host, () => {
-        logDebug(`[DX Cluster] DX Spider: connected to ${node.host}:${node.port} as ${loginCallsign}`);
-      });
-      
-      client.on('data', (data) => {
-        buffer += data.toString();
-        
-        // Wait for login prompt
-        if (!loginSent && (buffer.includes('login:') || buffer.includes('Please enter your call') || buffer.includes('enter your callsign'))) {
-          loginSent = true;
-          client.write(`${loginCallsign}\r\n`);
-          return;
-        }
-        
-        // Wait for prompt after login, then send command
-        if (loginSent && !commandSent && (buffer.includes('Hello') || buffer.includes('de ') || buffer.includes('>') || buffer.includes('GUEST') || buffer.includes(loginCallsign.split('-')[0]))) {
-          commandSent = true;
-          setTimeout(() => {
-            if (!resolved) {
-              client.write('sh/dx 25\r\n');
-            }
-          }, 1000);
-          return;
-        }
-        
-        // Parse DX spots from the output
-        const lines = buffer.split('\n');
-        for (const line of lines) {
-          if (line.includes('DX de ')) {
-            const match = line.match(/DX de ([A-Z0-9\/\-]+):\s+(\d+\.?\d*)\s+([A-Z0-9\/\-]+)\s+(.+?)\s+(\d{4})Z/i);
-            if (match) {
-              const spotter = match[1].replace(':', '');
-              const freqKhz = parseFloat(match[2]);
-              const dxCall = match[3];
-              const comment = match[4].trim();
-              const timeStr = match[5];
-              
-              if (!isNaN(freqKhz) && freqKhz > 0 && dxCall) {
-                const freqMhz = (freqKhz / 1000).toFixed(3);
-                const time = timeStr.substring(0, 2) + ':' + timeStr.substring(2, 4) + 'z';
-                
-                // Avoid duplicates
-                if (!spots.find(s => s.call === dxCall && s.freq === freqMhz)) {
-                  spots.push({
-                    freq: freqMhz,
-                    call: dxCall,
-                    comment: comment,
-                    time: time,
-                    spotter: spotter,
-                    source: 'DX Spider'
-                  });
-                }
-              }
-            }
-          }
-        }
-        
-        // If we have enough spots, close connection
-        if (spots.length >= 20) {
-          client.write('bye\r\n');
-          setTimeout(cleanup, 500);
-        }
-      });
-      
-      client.on('timeout', () => {
-        cleanup();
-      });
-      
-      client.on('error', (err) => {
-        // Only log unexpected errors, not connection issues (they're common)
-        if (!err.message.includes('ECONNRESET') && !err.message.includes('ETIMEDOUT') && !err.message.includes('ENOTFOUND') && !err.message.includes('ECONNREFUSED')) {
-          logErrorOnce('DX Cluster', `DX Spider ${node.host}: ${err.message}`);
-        }
-        cleanup();
-      });
-      
-      client.on('close', () => {
-        if (!resolved) {
-          resolved = true;
-          if (spots.length > 0) {
-            logDebug('[DX Cluster] DX Spider:', spots.length, 'spots from', node.host);
-            dxSpiderCache = { spots: spots, timestamp: Date.now() };
-            resolve(spots);
-          } else {
-            resolve(null);
-          }
-        }
-      });
-      
-      // Fallback timeout - close after 15 seconds regardless
-      setTimeout(() => {
-        if (!resolved) {
-          if (spots.length > 0) {
-            resolved = true;
-            logDebug('[DX Cluster] DX Spider:', spots.length, 'spots from', node.host);
-            dxSpiderCache = { spots: spots, timestamp: Date.now() };
-            resolve(spots);
-          }
-          cleanup();
-          if (!resolved) {
-            resolved = true;
-            resolve(null);
-          }
-        }
-      }, 15000);
-    });
   }
   
   // Fetch based on selected source
